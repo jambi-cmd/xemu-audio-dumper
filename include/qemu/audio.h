@@ -68,6 +68,9 @@ SWVoiceOut *AUD_open_out (
 void AUD_close_out (AudioBackend *be, SWVoiceOut *sw);
 size_t AUD_write (SWVoiceOut *sw, void *pcm_buf, size_t size);
 int  AUD_get_buffer_size_out (SWVoiceOut *sw);
+
+/* Optional forensic capture of the final PCM bytes accepted by host output. */
+void audio_dump_set_directory(const char *directory);
 void AUD_set_active_out(SWVoiceOut *sw, bool on);
 bool AUD_is_active_out(SWVoiceOut *sw);
 

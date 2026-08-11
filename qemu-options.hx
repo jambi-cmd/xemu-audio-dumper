@@ -24,6 +24,16 @@ SRST
     Display version information and exit
 ERST
 
+DEF("dump-audio", HAS_ARG, QEMU_OPTION_dump_audio,
+    "--dump-audio directory  write final host PCM streams as numbered WAV files\n",
+    QEMU_ARCH_ALL)
+SRST
+``--dump-audio directory``
+    Write each non-silent final host audio stream to a numbered WAV file in
+    ``directory``. A new file begins after silence and a file is finalized
+    after five seconds of silence.
+ERST
+
 DEF("machine", HAS_ARG, QEMU_OPTION_machine, \
     "-machine [type=]name[,prop[=value][,...]]\n"
     "                selects emulated machine ('-machine help' for list)\n"

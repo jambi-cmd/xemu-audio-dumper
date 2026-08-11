@@ -3332,6 +3332,9 @@ void qemu_init(int argc, char **argv)
                 default_audio = 0;
                 audio_parse_option(optarg);
                 break;
+            case QEMU_OPTION_dump_audio:
+                audio_dump_set_directory(optarg);
+                break;
             case QEMU_OPTION_audio: {
                 bool help;
                 char *model = NULL;

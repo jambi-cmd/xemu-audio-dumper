@@ -69,6 +69,147 @@ static AudiodevListHead audiodevs =
 static AudiodevListHead default_audiodevs =
     QSIMPLEQ_HEAD_INITIALIZER(default_audiodevs);
 
+/*
+ * This is deliberately attached after pcm_ops->write(): it captures exactly
+ * the bytes which the backend accepted, without participating in its flow
+ * control.  The dumper is for analysis, so write errors only disable dumping.
+ */
+typedef struct AudioDumpState {
+    char *directory;
+    FILE *file;
+    uint64_t data_bytes;
+    uint64_t silent_bytes;
+    unsigned int sequence;
+    struct audio_pcm_info info;
+    bool have_info;
+} AudioDumpState;
+
+static AudioDumpState audio_dump;
+#define AUDIO_DUMP_SILENCE_SECONDS 5
+
+static void audio_dump_u16(FILE *file, uint16_t value)
+{
+    uint8_t bytes[2] = { value, value >> 8 };
+    fwrite(bytes, 1, sizeof(bytes), file);
+}
+
+static void audio_dump_u32(FILE *file, uint32_t value)
+{
+    uint8_t bytes[4] = { value, value >> 8, value >> 16, value >> 24 };
+    fwrite(bytes, 1, sizeof(bytes), file);
+}
+
+static void audio_dump_finalize(void)
+{
+    if (!audio_dump.file) {
+        return;
+    }
+    if (audio_dump.data_bytes <= UINT32_MAX) {
+        fseek(audio_dump.file, 4, SEEK_SET);
+        audio_dump_u32(audio_dump.file, 36 + audio_dump.data_bytes);
+        fseek(audio_dump.file, 40, SEEK_SET);
+        audio_dump_u32(audio_dump.file, audio_dump.data_bytes);
+    }
+    fclose(audio_dump.file);
+    audio_dump.file = NULL;
+    audio_dump.data_bytes = 0;
+    audio_dump.silent_bytes = 0;
+}
+
+void audio_dump_set_directory(const char *directory)
+{
+    if (audio_dump.directory) {
+        error_report("--dump-audio may only be specified once");
+        exit(1);
+    }
+    if (g_mkdir_with_parents(directory, 0755) < 0) {
+        error_report("cannot create audio dump directory '%s': %s", directory,
+                     strerror(errno));
+        exit(1);
+    }
+    audio_dump.directory = g_strdup(directory);
+}
+
+static bool audio_dump_is_silent(const struct audio_pcm_info *info,
+                                 const uint8_t *data, size_t size)
+{
+    size_t index, sample_bytes = info->bits / 8;
+    uint8_t silence[8] = { 0 };
+
+    /* WAV/host PCM unsigned samples are centred at 2^(bits - 1). */
+    if (!info->is_signed && !info->is_float) {
+        silence[info->swap_endianness ? sample_bytes - 1 : 0] = 0x80;
+    }
+    if (!sample_bytes || size % sample_bytes) {
+        return false;
+    }
+    for (index = 0; index < size; index += sample_bytes) {
+        if (memcmp(data + index, silence, sample_bytes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void audio_dump_open(const struct audio_pcm_info *info)
+{
+    char *path = g_strdup_printf("%s%cstream-%06u.wav", audio_dump.directory,
+                                 G_DIR_SEPARATOR, audio_dump.sequence++);
+    audio_dump.file = fopen(path, "wb");
+    g_free(path);
+    if (!audio_dump.file) {
+        error_report("audio dumping disabled: cannot create WAV file: %s",
+                     strerror(errno));
+        g_clear_pointer(&audio_dump.directory, g_free);
+        return;
+    }
+    setvbuf(audio_dump.file, NULL, _IOFBF, 1024 * 1024);
+    fwrite("RIFF", 1, 4, audio_dump.file); audio_dump_u32(audio_dump.file, 0);
+    fwrite("WAVEfmt ", 1, 8, audio_dump.file); audio_dump_u32(audio_dump.file, 16);
+    audio_dump_u16(audio_dump.file, info->is_float ? 3 : 1);
+    audio_dump_u16(audio_dump.file, info->nchannels);
+    audio_dump_u32(audio_dump.file, info->freq);
+    audio_dump_u32(audio_dump.file, info->bytes_per_second);
+    audio_dump_u16(audio_dump.file, info->bytes_per_frame);
+    audio_dump_u16(audio_dump.file, info->bits);
+    fwrite("data", 1, 4, audio_dump.file); audio_dump_u32(audio_dump.file, 0);
+    audio_dump.info = *info;
+    audio_dump.have_info = true;
+}
+
+static void audio_dump_write(HWVoiceOut *hw, const void *buffer, size_t size)
+{
+    uint64_t silence_limit;
+    if (!audio_dump.directory || !size) {
+        return;
+    }
+    if (audio_dump.file && memcmp(&audio_dump.info, &hw->info, sizeof(hw->info))) {
+        audio_dump_finalize();
+    }
+    if (!audio_dump.file && audio_dump_is_silent(&hw->info, buffer, size)) {
+        return;
+    }
+    if (!audio_dump.file) {
+        audio_dump_open(&hw->info);
+    }
+    if (!audio_dump.file) {
+        return;
+    }
+    if (fwrite(buffer, 1, size, audio_dump.file) != size) {
+        error_report("audio dumping disabled: WAV write failed");
+        audio_dump_finalize();
+        g_clear_pointer(&audio_dump.directory, g_free);
+        return;
+    }
+    audio_dump.data_bytes += size;
+    silence_limit = (uint64_t) hw->info.bytes_per_second * AUDIO_DUMP_SILENCE_SECONDS;
+    audio_dump.silent_bytes = audio_dump_is_silent(&hw->info, buffer, size) ?
+        audio_dump.silent_bytes + size : 0;
+    if (audio_dump.silent_bytes >= silence_limit) {
+        audio_dump_finalize();
+    }
+}
+
 
 void audio_driver_register(audio_driver *drv)
 {
@@ -1469,6 +1610,8 @@ void audio_generic_run_buffer_out(HWVoiceOut *hw)
         write_len = MIN(hw->pending_emul, hw->size_emul - start);
 
         written = hw->pcm_ops->write(hw, hw->buf_emul + start, write_len);
+        /* Capture only the portion accepted by the backend. */
+        audio_dump_write(hw, hw->buf_emul + start, written);
         hw->pending_emul -= written;
 
         if (written < write_len) {
