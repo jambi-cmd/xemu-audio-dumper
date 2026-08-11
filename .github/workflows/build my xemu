@@ -1,0 +1,12 @@
+name: Build My Xemu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      ref: master
